@@ -506,7 +506,7 @@ class TestTopology(Tester):
         cluster = self.cluster
         cluster.populate(6).start()
         session = self.patient_cql_connection(cluster.nodelist()[0])
-        create_ks(session, 'ks', 1)
+        create_ks(session, 'ks', 6)
         create_cf(session, 'cf', columns={'c1': 'text', 'c2': 'text'})
         insert_c1c2(session, n=200, consistency=ConsistencyLevel.ALL)
         cluster.flush()
@@ -529,9 +529,13 @@ class TestTopology(Tester):
         node_to_move.stop(wait=False, gently=False)
 
         # watch node1 so we can fail fast
-        unexpected_str = f"Node /{old_ip} is now part of the cluster"
+        unexpected_str_v3 = f"Node /{old_ip} is now part of the cluster"
+        unexpected_str_v4 = f"Node /{old_ip}:7000 is now part of the cluster"
+        unexpected_str = f"{unexpected_str_v3}|{unexpected_str_v4}"
         try:
             node1.watch_log_for(unexpected_str, from_mark=node1_mark, timeout=120)
+            time.sleep(10)
+            insert_c1c2(session, n=200, consistency=ConsistencyLevel.ALL)
             assert False, f"old_ip {old_ip} unexpectedly joined in Node1"
         except TimeoutError:
             pass
@@ -547,8 +551,10 @@ def set_new_ip(node, new_address):
         'listen_address': new_address,
         'rpc_address': new_address,
     })
-    node.network_interfaces = { key: (new_address, port) for (key, (address, port)) in node.network_interfaces.items() }
-
+    for key, value in node.network_interfaces.items():
+        if value is not None:
+            address, port = value
+            node.network_interfaces[key] = (new_address, port)
 
 class DecommissionInParallel(Thread):
 
