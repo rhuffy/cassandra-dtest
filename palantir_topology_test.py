@@ -85,22 +85,3 @@ def key_is_owned_by_node(key, ks, cf, node):
     out = node.nodetool(f'getendpoints {ks} {cf} k{key}')[0]
     owners = out.split()
     return node.address() in owners
-
-def get_random_key_owned_by_node(node, ks, cf, length=8):
-    while True:
-        key = ''.join(random.choices(string.ascii_letters + string.digits, k=length))
-        out = node.nodetool(f'getendpoints {ks} {cf} {key}')[0]
-        logger.warn(out)
-        owners = out.split()
-        if node.address() in owners:
-            return key
-
-
-
-
-
-
-
-
-
-
