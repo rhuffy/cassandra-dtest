@@ -2,6 +2,7 @@ import re
 import time
 import pytest
 import logging
+import os
 
 from threading import Thread
 
@@ -10,7 +11,12 @@ from ccmlib.node import TimeoutError, ToolError
 
 from dtest import Tester, create_ks, create_cf, mk_bman_path
 from tools.assertions import assert_almost_equal, assert_all, assert_none
-from tools.data import insert_c1c2, query_c1c2
+from tools.data import insert_c1c2, query_c1c2, insert_columns
+from tools.jmxutils import JolokiaAgent, make_mbean
+
+from multiprocessing import Process
+from random import randint
+import json
 
 since = pytest.mark.since
 logger = logging.getLogger(__name__)
@@ -506,12 +512,12 @@ class TestTopology(Tester):
         cluster = self.cluster
         cluster.populate(6).start()
         session = self.patient_cql_connection(cluster.nodelist()[0])
-        create_ks(session, 'ks', 6)
+        create_ks(session, 'ks', 3)
         create_cf(session, 'cf', columns={'c1': 'text', 'c2': 'text'})
         insert_c1c2(session, n=200, consistency=ConsistencyLevel.ALL)
         cluster.flush()
 
-        node_to_move = cluster.nodelist()[-1]
+        node_to_move = cluster.nodelist()[5]
         old_ip = '127.0.0.6'
         node_to_move.stop(gently=False)
         set_new_ip(node_to_move, '127.0.0.9')
@@ -534,8 +540,6 @@ class TestTopology(Tester):
         unexpected_str = f"{unexpected_str_v3}|{unexpected_str_v4}"
         try:
             node1.watch_log_for(unexpected_str, from_mark=node1_mark, timeout=120)
-            time.sleep(10)
-            insert_c1c2(session, n=200, consistency=ConsistencyLevel.ALL)
             assert False, f"old_ip {old_ip} unexpectedly joined in Node1"
         except TimeoutError:
             pass
@@ -544,7 +548,147 @@ class TestTopology(Tester):
         for i, (node, mark) in enumerate(nodes_and_marks[1:]):
             res = node.grep_log(unexpected_str, from_mark=mark)
             assert len(res) == 0, f"old_ip {old_ip} unexpectedly joined in Node{i+1}"
+
+    def test_ip_swap_corrupts_ownership(self):
+        cluster_size = 9
         
+        cluster = self.cluster
+        cluster.populate(cluster_size).start()
+        session = self.patient_cql_connection(cluster.nodelist()[0])
+        create_ks(session, 'ks', 3)
+        create_cf(session, 'cf', columns={'c1': 'text', 'c2': 'text'})
+        insert_c1c2(session, n=200, consistency=ConsistencyLevel.ALL)
+        cluster.flush()
+
+        # ip shuffle occurs
+        # node1: ip1 -> ip5
+        # node2: ip5 -> ip1
+        initial_ring = self.get_cluster_ring_view()
+        # assert len(initial_ring) == 9
+
+        node1 = cluster.nodelist()[0]
+        node5 = cluster.nodelist()[4]
+
+        stop_and_change_ip(node1, '127.0.0.5')
+        stop_and_change_ip(node5, '127.0.0.1')
+        
+        p1 = Process(target=start_node, args=(node1,))
+        p2 = Process(target=start_node, args=(node5,))
+        p1.start()
+        p2.start()
+
+        for i in range(30):
+            matches = 0
+            for node in cluster.nodelist():
+                res = node.grep_log("have the same token")
+                if len(res) > 0:
+                    matches += 1
+            if matches > 2:
+                break
+            if i == 29:
+                assert False
+            time.sleep(1)
+
+        time.sleep(900)
+
+        # for _ in range(30):
+        #     current_ring = initial_ring
+        #     try:
+        #         current_ring = self.get_cluster_describering_view()
+        #     except:
+        #         pass
+        #     if len(current_ring) == len(initial_ring):
+        #         assert_ring_view_is_consistent(current_ring, cluster_size, nodes_to_ignore=[0,4], ref_node=2)
+
+    def test_ip_swap_corrupts_ownership_multi_rack(self):
+        cluster = self.cluster
+        cluster.populate(9)
+        cluster.set_configuration_options(values={'endpoint_snitch': 'org.apache.cassandra.locator.GossipingPropertyFileSnitch'})
+
+        for i, node in enumerate(cluster.nodelist()):
+            with open(os.path.join(node.get_conf_dir(), 'cassandra-rackdc.properties'), 'w') as snitch_file:
+                for line in ["dc=dc1", "rack=rack{}".format(i % 3 + 1)]:
+                    snitch_file.write(line + os.linesep)
+
+        cluster.start()
+
+        session = self.patient_cql_connection(cluster.nodelist()[0])
+        create_ks(session, 'ks', 3)
+        create_cf(session, 'cf', columns={'c1': 'text', 'c2': 'text'})
+        insert_c1c2(session, n=200, consistency=ConsistencyLevel.ALL)
+        cluster.flush()
+
+        rack0_nodes = (cluster.nodelist()[0], cluster.nodelist()[3], cluster.nodelist()[6])
+        stop_and_change_ip(rack0_nodes[0], '127.0.0.4')
+        stop_and_change_ip(rack0_nodes[1], '127.0.0.1')
+        rack0_nodes[2].stop(gently=False)
+
+        ps = [Process(target=start_node, args=(node,)) for node in rack0_nodes]
+        for p in ps:
+            p.start()
+
+        for i in range(600):
+            matches = 0
+            for node in cluster.nodelist():
+                res = node.grep_log("have the same token")
+                if len(res) > 0:
+                    matches += 1
+            if matches > 2:
+                assert False
+            time.sleep(1)
+
+    def get_cluster_ring_view(self):
+        return {i:get_ring_view(node.nodetool('ring')) for i, node in enumerate(self.cluster.nodelist())}
+
+    def get_cluster_describering_view(self):
+        return {i:get_ring_view(node.nodetool('describering')) for i, node in enumerate(self.cluster.nodelist())}
+
+
+def stop_and_change_ip(node, new_ip):
+    node.stop(gently=False)
+    set_new_ip(node, new_ip)
+
+def start_node(node):
+    node.mark_log_for_errors()
+    node.__conf_updated = False
+    node.start(no_wait=True, wait_other_notice=False)
+    time.sleep(10)
+    while node.grep_log_for_errors():
+        node.stop(gently=False)
+        time.sleep(randint(10, 25))
+        node.mark_log_for_errors()
+        node.__conf_updated = False
+        node.start(no_wait=True, wait_other_notice=False)
+        time.sleep(10)
+    # p = Process(node.start, kwargs={wait_other_notice: True})
+    # p.start()
+    # p.join(10)
+    # if p.exitcode is None:
+    #     time.sleep(randint(0, 6))
+    #     node.stop()
+    #     start_node(node)
+
+def assert_ring_view_is_consistent(node_to_ring_view, cluster_size, nodes_to_ignore=[], ref_node=2):
+    ref_ring_view = node_to_ring_view[ref_node]
+    for node_num, ring_view in node_to_ring_view.items():
+        if node_num not in {0,4,ref_node} and len(ref_ring_view) == len(ring_view) == cluster_size:
+            assert ring_view == ref_ring_view, f"Node{ref_node+1} and Node{node_num+1} disagree about token ring"
+
+def get_ring_view(nt_ring_output):
+    out, _, _ = nt_ring_output
+    output_lines = out.split('Datacenter')[1].splitlines()[4:]
+    to_return = dict()
+    for line in output_lines:
+        values = line.split()
+        if len(values) == 8:
+            address, rack, status, state, load, load_unit, owns, token = line.split()
+            to_return[address] = token
+    return to_return
+
+def get_token_ranges(nt_describering_output):
+    out, _, _ = nt_describering_output
+    output_lines = out.split('TokenRange:')[1].splitlines()
+    return output_lines.set()
 
 def set_new_ip(node, new_address):
     node.set_configuration_options(values={
@@ -555,6 +699,22 @@ def set_new_ip(node, new_address):
         if value is not None:
             address, port = value
             node.network_interfaces[key] = (new_address, port)
+
+def parse_gossipinfo(gossipinfo_str):
+    results = dict()
+    current_ep = None
+    current_entries = dict()
+    for line in gossipinfo_str.splitlines():
+        if line[0] == '/':
+            if current_ep is not None:
+                results[current_ep] = current_entries
+            current_ep = line[1:]
+            current_entries = dict()
+        else:
+            key, value = line.split(':', 1)
+            current_entries[key.strip()] = value.strip()
+    results[current_ep] = current_entries
+    return results
 
 class DecommissionInParallel(Thread):
 
