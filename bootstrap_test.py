@@ -288,6 +288,42 @@ class BootstrapTester(Tester):
 
              assert_bootstrap_state(self, node2, 'COMPLETED')
              assert node2.grep_log('Bootstrap completed', filename='debug.log')
+    
+    def test_bootstrap_schema_timeout(self):
+        """
+        Test bootstrapping a node with a lower rpc timeout.
+        """
+
+        cluster = self.cluster
+        cluster.populate(1)
+
+        cluster.set_configuration_options(values={'request_timeout_in_ms': 1000})
+        # cluster.set_log_level("TRACE")
+
+        logger.debug("Create a cluster")
+        node1 = cluster.nodelist()[0]
+
+
+        logger.debug("Start node 1")
+        node1.start(wait_for_binary_proto=True, jvm_args=['-Dpalantir_cassandra.disable_wait_to_bootstrap=true'])
+
+        session = self.patient_cql_connection(node1)
+        for i in range(3):
+            ks_name = f'ks_{i}'
+            create_ks(session, ks_name, 1)
+            for j in range(10):
+                cf_name = f'cf_{j}'
+                create_cf(session, cf_name, columns={'c1': 'text', 'c2': 'text'})
+
+        # logger.debug("Insert 10k rows")
+        # node1.stress(['write', 'n=10K', 'no-warmup', '-rate', 'threads=8', '-schema', 'replication(factor=2)'])
+
+        logger.debug("Bootstrap node 2")
+        node2 = new_node(cluster)
+        node2.start(wait_for_binary_proto=True, jvm_args=['-Dpalantir_cassandra.disable_wait_to_bootstrap=true'])
+
+        # assert_bootstrap_state(self, node2, 'COMPLETED')
+        time.sleep(900)
 
     def test_consistent_range_movement_true_with_replica_down_should_fail(self):
         self._bootstrap_test_with_replica_down(True)
