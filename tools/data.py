@@ -37,7 +37,7 @@ def insert_c1c2(session, ks=None, keys=None, n=None, consistency=ConsistencyLeve
 
 
 def query_c1c2(session, key, consistency=ConsistencyLevel.QUORUM, tolerate_missing=False, must_be_missing=False, max_attempts=1):
-    query = SimpleStatement('SELECT c1, c2 FROM cf WHERE key=\'k%d\'' % key, consistency_level=consistency)
+    query = SimpleStatement('SELECT c1, c2 FROM cf WHERE key=\'k{}\''.format(key), consistency_level=consistency)
     rows = list(retry(lambda: session.execute(query), max_attempts=max_attempts))
     if not tolerate_missing:
         assertions.assert_length_equal(rows, 1)
