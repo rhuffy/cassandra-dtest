@@ -77,6 +77,51 @@ class TestPalantirTopology(Tester):
                 successful_reads += 1
         assert successful_reads > 0
 
+    def test_bootstrap_with_ip_change(self):
+        """
+        A node bounces and changes ip during bootstrap
+        """
+
+        cluster = self.cluster
+        cluster.populate(3).start()
+
+        session = self.patient_cql_connection(cluster.nodelist()[0])
+        create_ks(session, 'ks', 3)
+        create_cf(session, 'cf', columns={'c1': 'text', 'c2': 'text'})
+
+        node4 = new_node(cluster)
+        node4.start()
+
+        node4.watch_log_for('WAITING_TO_BOOTSTRAP')
+
+        with JolokiaAgent(node4) as jmx:
+            ss = make_mbean('db', type='StorageService')
+            jmx.execute_method(ss, 'startBootstrap')
+
+        stop_and_change_ip(node1, '124.0.0.9')
+        node1.start()
+
+        node4.watch_log_for('Bootstrap almost complete')
+
+        with JolokiaAgent(node4) as jmx:
+            ss = make_mbean('db', type='StorageService')
+            jmx.execute_method(ss, 'finishBootstrap')
+        
+        node4.watch_log_for("Starting listening for CQL clients")
+
+        session = self.patient_cql_connection(node4)
+        session.execute('USE ks')
+
+        successful_reads = 0
+        for key in keys:
+            if key_is_owned_by_node(key, 'ks', 'cf', node4):
+                query_c1c2(session, key, consistency=ConsistencyLevel.ONE)
+                successful_reads += 1
+        assert successful_reads > 0
+
+def stop_and_change_ip(node, new_ip):
+    node.stop(gently=False)
+    set_new_ip(node, new_ip)
 
 def get_random_string(length=8):
     return ''.join(random.choices(string.ascii_letters + string.digits, k=length))
