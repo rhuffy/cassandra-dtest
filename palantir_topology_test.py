@@ -119,9 +119,80 @@ class TestPalantirTopology(Tester):
                 successful_reads += 1
         assert successful_reads > 0
 
+    def test_schema_change_ip_change(self):
+        """
+        CASSANDRA-15158 and followups.
+        Test that if schema changes while a node restarts and changes ip,
+        the schema is propagated.
+
+        Specifically, consider a 2 node cluster.
+
+        Node1 -> IPA
+        Node2 -> IPB
+
+        Sequence:
+        - Node1 goes down
+        - Node2 goes down
+        - Node1 comes up with IPC
+        - Node1 changes its schema
+        - Node2 comes up with IPD
+
+        Assert that Node2 pulls the schema from Node1, and encounters no errors on startup.
+        Assert that a new node can bootstrap, and doesn't try to pull schema from the old IPs
+        """
+        cluster = self.cluster
+        cluster.populate(2).start()
+        node1, node2 = cluster.nodelist()
+
+        session = self.patient_cql_connection(node1)
+        create_ks(session, 'ks', 2)
+        create_cf(session, 'cf', columns={'c1': 'text', 'c2': 'text'})
+
+        stop_and_change_ip(node1, '127.0.0.8')
+        stop_and_change_ip(node2, '127.0.0.9')
+
+        node1.start()
+
+        session = self.patient_cql_connection(node1)
+        create_ks(session, 'ks2', 2)
+        create_cf(session, 'cf2', columns={'c1': 'text', 'c2': 'text'})
+
+        node2.start()
+
+        time.sleep(10)
+
+        node3 = new_node(cluster)
+        node3.start()
+
+        node3.watch_log_for('WAITING_TO_BOOTSTRAP')
+
+        with JolokiaAgent(node3) as jmx:
+            ss = make_mbean('db', type='StorageService')
+            jmx.execute_method(ss, 'startBootstrap')
+        
+        node3.watch_log_for('Bootstrap almost complete')
+
+        with JolokiaAgent(node4) as jmx:
+            ss = make_mbean('db', type='StorageService')
+            jmx.execute_method(ss, 'finishBootstrap')
+        
+        node3.watch_log_for("Starting listening for CQL clients")
+        assert True
+
+
 def stop_and_change_ip(node, new_ip):
     node.stop(gently=False)
     set_new_ip(node, new_ip)
+
+def set_new_ip(node, new_address):
+    node.set_configuration_options(values={
+        'listen_address': new_address,
+        'rpc_address': new_address,
+    })
+    for key, value in node.network_interfaces.items():
+        if value is not None:
+            address, port = value
+            node.network_interfaces[key] = (new_address, port)
 
 def get_random_string(length=8):
     return ''.join(random.choices(string.ascii_letters + string.digits, k=length))
